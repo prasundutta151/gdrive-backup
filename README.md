@@ -7,6 +7,8 @@
 
 A robust, incremental Google Drive backup utility and real-time status monitor built on top of [rclone](https://rclone.org/) and systemd user services.
 
+Current version: **1.1.0**
+
 Provides background job execution, natural-language timer scheduling, pre-backup transfer size estimation, and real-time progress monitoring with live terminal dashboards.
 
 ---
@@ -85,18 +87,37 @@ source ~/.bashrc   # or source ~/.bash_aliases
    # Or official script
    curl https://rclone.org/install.sh | sudo bash
    ```
-3. **Configure Google Drive in rclone**:
+3. **Configure the folders and Google Drive account**:
    ```bash
-   rclone config
+   gdrive-setup --local ~/Documents --web Document_Astrolab
    ```
-   - Type `n` for new remote.
-   - Name the remote `gdrive`.
-   - Choose `drive` (Google Drive) as the storage type.
-   - Follow the browser authentication prompt to authorize Google Drive access.
+   `gdrive-setup` reuses an existing `gdrive:` remote or opens rclone's Google
+   authentication flow when it needs to create one.
 
 ---
 
 ## Usage & Examples
+
+### 0. Configure folders and Google Drive
+
+`gdrive-setup` performs the initial setup, saves the default local and Drive
+folders, and creates or verifies rclone's Google Drive authentication:
+
+```bash
+gdrive-setup --local ~/Documents --web Document_Astrolab
+```
+
+`--web` accepts either a folder name (using the default `gdrive` remote) or a
+complete rclone destination:
+
+```bash
+gdrive-setup --local ~/Research --web gdrive:Research_Backup
+gdrive-setup --show
+gdrive-setup --reauth
+```
+
+The defaults are saved in `~/.config/gdrive-backup/config.json`. Command-level
+`--source` and `--dest` options still override them for a single run.
 
 ### 1. Check Backup Status
 

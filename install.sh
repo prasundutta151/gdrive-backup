@@ -64,6 +64,7 @@ fi
 
 # 4. Create symlinks for all tool commands
 COMMANDS=(
+    "gdrive-setup"
     "gdrive-backup-status"
     "gdrive-status"
     "gdrive-backup-now"
@@ -129,6 +130,7 @@ echo -e "\n${COLOR_GREEN}=======================================================
 echo -e "${COLOR_GREEN} Installation Complete!${COLOR_RESET}"
 echo -e "${COLOR_GREEN}====================================================================${COLOR_RESET}"
 echo -e "Available commands:"
+echo -e "  • ${COLOR_BLUE}gdrive-setup${COLOR_RESET}              - Configure folders and Google Drive authentication"
 echo -e "  • ${COLOR_BLUE}gdrive-backup-status${COLOR_RESET}     - Check active backup status, elapsed time & progress"
 echo -e "  • ${COLOR_BLUE}gdrive-backup-status -w${COLOR_RESET}  - Live updating terminal progress display"
 echo -e "  • ${COLOR_BLUE}gdrive-backup-now${COLOR_RESET}        - Start incremental backup immediately"

@@ -8,6 +8,7 @@ TARGET_BIN_DIR="${HOME}/.local/bin"
 
 COMMANDS=(
     "gdrive-backup"
+    "gdrive-setup"
     "gdrive-backup-status"
     "gdrive-status"
     "gdrive-backup-now"

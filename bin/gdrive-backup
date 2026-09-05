@@ -1,0 +1,1050 @@
+#!/usr/bin/env python3
+"""
+Google Drive Backup Manager
+Provides CLI utilities for incremental Google Drive backup via rclone and systemd:
+  - gdrive-backup-status:     Inspect whether backup is active, start time, and progress
+  - gdrive-backup-now:        Start incremental backup immediately
+  - gdrive-bakup-schedule:    Schedule incremental backup at specified datetime
+  - gdrive-backup-estimate:   Estimate backup size, transfer time, or inspect live progress
+  - gdrive-backup-stop:       Stop active backup or cancel scheduled timers
+"""
+from __future__ import annotations
+
+import datetime
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+DEFAULT_SOURCE = str(Path.home() / "Documents")
+DEFAULT_DEST = "gdrive:Document_Astrolab"
+PRIMARY_SERVICE_UNIT = "document-astrolab-backup"
+SCHEDULED_UNIT = "gdrive-backup-scheduled"
+RCLONE_BIN = shutil.which("rclone") or "/usr/bin/rclone"
+
+RCLONE_FLAGS = [
+    "--create-empty-src-dirs",
+    "--links",
+    "--transfers", "4",
+    "--checkers", "8",
+    "--retries", "3",
+    "--low-level-retries", "10",
+]
+
+
+def resolve_dest(source_path: str, custom_dest: str | None = None) -> str:
+    """Determine the remote Google Drive destination path."""
+    if custom_dest:
+        return custom_dest if custom_dest.startswith("gdrive:") else f"gdrive:{custom_dest}"
+    source_abs = os.path.abspath(os.path.expanduser(source_path))
+    docs_abs = os.path.abspath(os.path.expanduser("~/Documents"))
+    if source_abs == docs_abs:
+        return DEFAULT_DEST
+    folder_name = os.path.basename(source_abs.rstrip("/"))
+    if not folder_name:
+        folder_name = "Root"
+    return f"gdrive:{folder_name}_Astrolab"
+
+
+def format_bytes(n: float | int) -> str:
+    """Format bytes into human-readable string."""
+    for unit in ["B", "KiB", "MiB", "GiB", "TiB"]:
+        if abs(n) < 1024.0:
+            return f"{n:.2f} {unit}"
+        n /= 1024.0
+    return f"{n:.2f} PiB"
+
+
+def format_seconds(seconds: float | int) -> str:
+    """Format seconds into human-readable duration."""
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {secs:02d}s"
+    hours, mins = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {mins:02d}m {secs:02d}s"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours:02d}h {mins:02d}m"
+
+
+def make_progress_bar(percent: float | None, width: int = 24) -> str:
+    """Generate a clean visual terminal progress bar."""
+    if percent is None:
+        return ""
+    percent = max(0.0, min(100.0, percent))
+    filled = int(round(width * percent / 100.0))
+    bar = "█" * filled + "░" * (width - filled)
+    return f"[{bar}] {percent:.1f}%"
+
+
+def get_scheduled_timer_info() -> dict[str, Any] | None:
+    """Check if a scheduled backup timer is currently active."""
+    try:
+        is_act = subprocess.run(
+            ["systemctl", "--user", "is-active", f"{SCHEDULED_UNIT}.timer"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+        if is_act in ("active", "waiting"):
+            list_res = subprocess.run(
+                ["systemctl", "--user", "list-timers", f"{SCHEDULED_UNIT}.timer", "--no-pager"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for line in list_res.stdout.splitlines():
+                if SCHEDULED_UNIT in line:
+                    return {"active": True, "unit": f"{SCHEDULED_UNIT}.timer", "next_run": line.strip()}
+            return {"active": True, "unit": f"{SCHEDULED_UNIT}.timer", "next_run": "Pending"}
+    except Exception:
+        pass
+    return None
+
+
+def get_last_backup_info() -> dict[str, str] | None:
+    """Retrieve completion details of the most recent backup run."""
+    try:
+        show_res = subprocess.run(
+            ["systemctl", "--user", "show", PRIMARY_SERVICE_UNIT, "--property=ExecMainExitTimestamp,ExecMainStatus,Result"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        data: dict[str, str] = {}
+        for line in show_res.stdout.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                data[k.strip()] = v.strip()
+        exit_ts = data.get("ExecMainExitTimestamp", "")
+        if exit_ts:
+            exit_code = data.get("ExecMainStatus", "0")
+            result = data.get("Result", "success")
+            status_desc = "Completed successfully" if exit_code == "0" and result == "success" else f"Exited with code {exit_code} ({result})"
+            return {"exit_time": exit_ts, "status": status_desc, "code": exit_code}
+    except Exception:
+        pass
+    return None
+
+
+def parse_common_args(args: list[str]) -> tuple[str, str, bool, list[str]]:
+    """
+    Extract --source/-s, --dest/-d, --fg/--foreground flags.
+    Returns: (source_path, dest_path, is_foreground, remaining_positional_args)
+    """
+    source = DEFAULT_SOURCE
+    custom_dest = None
+    is_fg = False
+    remaining: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("--source", "-s"):
+            if i + 1 < len(args):
+                source = args[i + 1]
+                i += 2
+                continue
+            else:
+                print("Error: --source requires a folder argument.", file=sys.stderr)
+                sys.exit(1)
+        elif arg.startswith("--source="):
+            source = arg.split("=", 1)[1]
+            i += 1
+            continue
+        elif arg in ("--dest", "-d"):
+            if i + 1 < len(args):
+                custom_dest = args[i + 1]
+                i += 2
+                continue
+            else:
+                print("Error: --dest requires a destination argument.", file=sys.stderr)
+                sys.exit(1)
+        elif arg.startswith("--dest="):
+            custom_dest = arg.split("=", 1)[1]
+            i += 1
+            continue
+        elif arg in ("--fg", "--foreground", "-f"):
+            is_fg = True
+            i += 1
+            continue
+        else:
+            remaining.append(arg)
+            i += 1
+
+    source_path = os.path.abspath(os.path.expanduser(source))
+    dest = resolve_dest(source_path, custom_dest)
+    return source_path, dest, is_fg, remaining
+
+
+def get_active_backup_info(request_fresh_stats: bool = False) -> dict[str, Any] | None:
+    """Check whether a Google Drive backup is currently active and gather detailed status."""
+    # 1. Check systemd user services
+    active_unit = None
+    pid = None
+    start_time = None
+    for unit in [PRIMARY_SERVICE_UNIT, SCHEDULED_UNIT, "gdrive-backup"]:
+        res = subprocess.run(
+            ["systemctl", "--user", "is-active", unit],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if res.stdout.strip() == "active":
+            active_unit = unit
+            show_res = subprocess.run(
+                ["systemctl", "--user", "show", unit, "--property=MainPID,ExecMainStartTimestamp"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for line in show_res.stdout.splitlines():
+                if line.startswith("MainPID="):
+                    try:
+                        pid = int(line.split("=", 1)[1])
+                    except ValueError:
+                        pass
+                elif line.startswith("ExecMainStartTimestamp="):
+                    start_time = line.split("=", 1)[1]
+            break
+
+    # 2. Check running rclone copy processes directly
+    pgrep_res = subprocess.run(
+        ["pgrep", "-af", "rclone copy .*gdrive:"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    rclone_lines = [l for l in pgrep_res.stdout.splitlines() if "gdrive-backup" not in l and "grep" not in l]
+
+    if not active_unit and not rclone_lines:
+        return None
+
+    if not pid and rclone_lines:
+        try:
+            pid = int(rclone_lines[0].split()[0])
+        except (ValueError, IndexError):
+            pid = None
+
+    # Determine source & destination from running process command line if possible
+    detected_source = DEFAULT_SOURCE
+    detected_dest = DEFAULT_DEST
+    if rclone_lines:
+        m = re.search(r"rclone\s+copy\s+(\S+)\s+(\S+)", rclone_lines[0])
+        if m:
+            detected_source = os.path.abspath(os.path.expanduser(m.group(1)))
+            detected_dest = m.group(2)
+
+    elapsed_secs = None
+    if pid:
+        try:
+            ps_out = subprocess.check_output(["ps", "-p", str(pid), "-o", "etimes=", "-o", "lstart="], text=True).strip()
+            parts = ps_out.split(None, 1)
+            if parts:
+                elapsed_secs = int(parts[0])
+                if not start_time and len(parts) > 1:
+                    start_time = parts[1]
+        except Exception:
+            pass
+
+    # Optionally trigger rclone to dump an immediate fresh stats block
+    if request_fresh_stats and pid:
+        try:
+            os.kill(pid, signal.SIGUSR2)
+            time.sleep(0.35)
+        except Exception:
+            pass
+
+    # 3. Read latest rclone progress from journalctl or unit or fallback log file
+    log_content = ""
+    journal_unit = active_unit or PRIMARY_SERVICE_UNIT
+    journal_res = subprocess.run(
+        ["journalctl", "--user", "-u", journal_unit, "-n", "350", "--no-pager"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if journal_res.returncode == 0 and journal_res.stdout.strip():
+        log_content = journal_res.stdout
+    else:
+        log_file = Path.home() / ".cache" / "gdrive-backup.log"
+        if log_file.exists():
+            try:
+                log_content = log_file.read_text(errors="replace")[-25000:]
+            except Exception:
+                pass
+
+    m1 = re.findall(
+        r"Transferred:\s+([0-9.]+\s*[A-Za-z]+)\s*/\s*([0-9.]+\s*[A-Za-z]+),\s*([0-9]+%|-),\s*([0-9.]+\s*[A-Za-z/]+),\s*ETA\s*(\S+)",
+        log_content,
+    )
+    m2 = re.findall(
+        r"Transferred:\s+([0-9]+)\s*/\s*([0-9]+)(?:,\s*([0-9]+%|-))?",
+        log_content,
+    )
+    m_checks = re.findall(
+        r"Checks:\s+([0-9]+)\s*/\s*([0-9]+)(?:,\s*([0-9]+%|-))?",
+        log_content,
+    )
+    m_err = re.findall(
+        r"Errors:\s+([0-9]+)(?:\s*\((.*?)\))?",
+        log_content,
+    )
+    m_time = re.findall(r"Elapsed time:\s+(\S+)", log_content)
+
+    lines = log_content.splitlines()
+    last_xfer_idx = -1
+    for i, line in enumerate(lines):
+        if "Transferring:" in line:
+            last_xfer_idx = i
+
+    active_transfers: list[dict[str, str]] = []
+    if last_xfer_idx != -1:
+        for line in lines[last_xfer_idx + 1:]:
+            m = re.search(
+                r":\s+\*\s+(.*?):\s*([0-9]+%|-)\s*/\s*([0-9.]+\s*[A-Za-z]*)(?:,\s*([0-9.]+\s*[A-Za-z/]*))?(?:,\s*(\S+))?",
+                line,
+            )
+            if m:
+                active_transfers.append({
+                    "name": m.group(1).strip(),
+                    "percent": m.group(2).strip(),
+                    "size": m.group(3).strip(),
+                    "speed": m.group(4).strip() if m.group(4) else "",
+                    "eta": m.group(5).strip() if m.group(5) else "",
+                })
+            elif any(k in line for k in ["INFO  :", "Transferred:", "Errors:", "Checks:", "Elapsed time:"]):
+                break
+
+    m_copied = re.findall(r"INFO\s*:\s+(.*?):\s*Copied\s*(?:\((.*?)\))?", log_content)
+
+    stats_bytes = None
+    if m1:
+        tb, tot_b, pb, spd, eta = m1[-1]
+        pct_b = float(pb.replace("%", "").strip()) if "%" in pb else 0.0
+        stats_bytes = {
+            "transferred_bytes": tb.strip(),
+            "total_bytes": tot_b.strip(),
+            "percent_bytes": pb.strip(),
+            "percent_num": pct_b,
+            "speed": spd.strip(),
+            "eta": eta.strip(),
+        }
+
+    stats_files = None
+    if m2:
+        tf, tot_f, pf = m2[-1]
+        pct_f = float(pf.replace("%", "").strip()) if pf and "%" in pf else (float(tf) / float(tot_f) * 100 if int(tot_f) > 0 else 0.0)
+        stats_files = {
+            "transferred_files": tf.strip(),
+            "total_files": tot_f.strip(),
+            "percent_files": pf.strip() if pf else f"{pct_f:.0f}%",
+            "percent_num": pct_f,
+        }
+
+    checks_dict = None
+    if m_checks:
+        c_done, c_tot, c_pct = m_checks[-1]
+        checks_dict = {
+            "transferred": c_done.strip(),
+            "total": c_tot.strip(),
+            "percent": c_pct.strip() if c_pct else "100%",
+        }
+
+    errors_dict = None
+    if m_err:
+        errors_dict = {
+            "count": m_err[-1][0].strip(),
+            "msg": m_err[-1][1].strip() if m_err[-1][1] else "",
+        }
+
+    return {
+        "unit": active_unit,
+        "pid": pid,
+        "start_time": start_time,
+        "elapsed_secs": elapsed_secs,
+        "elapsed_str": format_seconds(elapsed_secs) if elapsed_secs is not None else (m_time[-1].strip() if m_time else None),
+        "source": detected_source,
+        "dest": detected_dest,
+        "stats_bytes": stats_bytes,
+        "stats_files": stats_files,
+        "checks": checks_dict,
+        "errors": errors_dict,
+        "transferring": active_transfers,
+        "recent_copied": m_copied[-4:] if m_copied else [],
+        "process_cmd": rclone_lines[0] if rclone_lines else None,
+    }
+
+
+def render_status(active: dict[str, Any] | None, requested_source: str | None = None, is_json: bool = False) -> None:
+    """Render the backup status display in formatted text or JSON."""
+    if is_json:
+        payload: dict[str, Any] = {
+            "active": bool(active),
+            "timestamp": datetime.datetime.now().isoformat(),
+        }
+        if active:
+            payload.update(active)
+        else:
+            payload["timer"] = get_scheduled_timer_info()
+            payload["last_backup"] = get_last_backup_info()
+        print(json.dumps(payload, indent=2))
+        return
+
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if active:
+        unit = active.get("unit")
+        pid = active.get("pid")
+        start_time = active.get("start_time")
+        elapsed_secs = active.get("elapsed_secs")
+        elapsed_str = active.get("elapsed_str")
+        source = active.get("source") or DEFAULT_SOURCE
+        dest = active.get("dest") or DEFAULT_DEST
+        sb = active.get("stats_bytes")
+        sf = active.get("stats_files")
+        checks = active.get("checks")
+        errors = active.get("errors")
+        transferring = active.get("transferring") or []
+        recent_copied = active.get("recent_copied") or []
+
+        print("=" * 68)
+        print(f" \033[1;32mGoogle Drive Backup — Status: ACTIVE / RUNNING\033[0m  [{now_str}]")
+        print("=" * 68)
+        print(f" Status:           \033[1;32mRUNNING / IN PROGRESS\033[0m")
+        if unit:
+            print(f" Service Unit:     {unit}.service (active)")
+        if pid:
+            print(f" Process PID:      {pid}")
+        print(f" Source Folder:    {source}")
+        print(f" Destination:      {dest}")
+        print(f" Policy:           Incremental (existing remote files preserved)")
+
+        if requested_source and os.path.abspath(requested_source) != os.path.abspath(source):
+            print(f" \033[1;33m[Note]\033[0m Requested source '{requested_source}' differs from active source.")
+
+        print("\n \033[1m[Timing Information]\033[0m")
+        if start_time:
+            ago = f" ({format_seconds(elapsed_secs)} ago)" if elapsed_secs is not None else ""
+            print(f"   • Started At:   {start_time}{ago}")
+        if elapsed_str:
+            print(f"   • Elapsed Time: {elapsed_str}")
+        if sb and sb.get("eta"):
+            print(f"   • Estimated ETA:\033[1;36m {sb['eta']}\033[0m remaining")
+
+        print("\n \033[1m[Transfer Progress]\033[0m")
+        if sb:
+            bar_b = make_progress_bar(sb.get("percent_num"))
+            print(f"   • Data Transferred: \033[1m{sb['transferred_bytes']}\033[0m / {sb['total_bytes']} ({sb['percent_bytes']})")
+            print(f"     {bar_b}")
+        else:
+            print("   • Data Transferred: Initializing transfer stats...")
+
+        if sf:
+            bar_f = make_progress_bar(sf.get("percent_num"))
+            print(f"   • Files Processed:  \033[1m{sf['transferred_files']}\033[0m / {sf['total_files']} files ({sf['percent_files']})")
+            print(f"     {bar_f}")
+
+        if sb and sb.get("speed"):
+            print(f"   • Transfer Speed:   {sb['speed']}")
+
+        if checks:
+            print(f"   • Already Synced:   {checks['transferred']} / {checks['total']} files ({checks['percent']})")
+
+        if errors and errors.get("count") != "0":
+            err_msg = f" ({errors.get('msg')})" if errors.get("msg") else ""
+            print(f"   • Errors / Retries: \033[1;33m{errors['count']}{err_msg}\033[0m")
+
+        if transferring:
+            print("\n \033[1m[Currently Transferring Files]\033[0m")
+            for t in transferring:
+                name = t.get("name", "")
+                pct = t.get("percent", "")
+                sz = t.get("size", "")
+                spd = t.get("speed", "")
+                eta = t.get("eta", "")
+                spd_part = f", {spd}" if spd and spd != "0/s" else ""
+                eta_part = f", ETA {eta}" if eta and eta != "-" else ""
+                print(f"   • {name} ({pct} of {sz}{spd_part}{eta_part})")
+
+        if recent_copied:
+            print("\n \033[1m[Recently Copied Files]\033[0m")
+            for item in recent_copied[-4:]:
+                name = item[0] if isinstance(item, (list, tuple)) else str(item)
+                note = item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else ""
+                note_str = f" ({note})" if note else ""
+                print(f"   • {name}{note_str}")
+
+        print("=" * 68)
+        print(" Commands:")
+        print("   • Live Watch:   \033[1mgdrive-backup-status --watch\033[0m")
+        print("   • Stop Backup:  \033[1mgdrive-backup-stop\033[0m\n")
+
+    else:
+        print("=" * 68)
+        print(f" \033[1;34mGoogle Drive Backup — Status: IDLE\033[0m  [{now_str}]")
+        print("=" * 68)
+        print(f" Status:           \033[1;37mIDLE (No backup is currently running)\033[0m")
+        print(f" Default Source:   {DEFAULT_SOURCE}")
+        print(f" Destination:      {DEFAULT_DEST}")
+
+        timer_info = get_scheduled_timer_info()
+        print("\n \033[1m[Scheduled Timer]\033[0m")
+        if timer_info and timer_info.get("active"):
+            print(f"   • Timer Unit:   {timer_info['unit']} (\033[1;32mActive\033[0m)")
+            print(f"   • Next Run:     {timer_info.get('next_run', 'Scheduled')}")
+        else:
+            print("   • Status:       No scheduled timer pending")
+
+        last_info = get_last_backup_info()
+        if last_info and last_info.get("exit_time"):
+            print("\n \033[1m[Last Backup Activity]\033[0m")
+            print(f"   • Finished At:  {last_info['exit_time']}")
+            print(f"   • Exit Result:  {last_info['status']}")
+
+        print("\n" + "=" * 68)
+        print(" Quick Actions:")
+        print("   • Start Backup Now:      \033[1mgdrive-backup-now\033[0m")
+        print("   • Schedule for Later:    \033[1mgdrive-bakup-schedule \"<datetime>\"\033[0m")
+        print("   • Estimate Upload Size:  \033[1mgdrive-backup-estimate\033[0m\n")
+
+
+def cmd_status(args: list[str]) -> int:
+    """Display live Google Drive backup progress and execution status."""
+    source_path, _, _, remaining = parse_common_args(args)
+    is_json = "--json" in remaining
+    is_watch = "--watch" in remaining or "-w" in remaining
+
+    if "-h" in remaining or "--help" in remaining or "help" in remaining:
+        print("""\033[1mUsage:\033[0m gdrive-backup-status [options]
+\033[1mAliases:\033[0m gdrive-backup status, gdrive-status
+
+Show whether a Google Drive backup is currently active, when it started,
+how much data and how many files have completed, transfer speed, and ETA.
+
+\033[1mOptions:\033[0m
+  -w, --watch          Continuously update status display every 2-3 seconds
+  --json               Output status details in structured JSON format
+  --source <folder>    Filter or verify backup status for a specific source directory
+  -h, --help           Show this help message
+
+\033[1mExamples:\033[0m
+  gdrive-backup-status              # Show current backup status
+  gdrive-backup-status --watch      # Monitor live transfer progress in real time
+  gdrive-backup-status --json       # Output machine-readable JSON
+""")
+        return 0
+
+    if is_watch:
+        try:
+            while True:
+                print("\033[2J\033[H", end="")
+                info = get_active_backup_info(request_fresh_stats=True)
+                render_status(info, requested_source=source_path, is_json=is_json)
+                time.sleep(2.5)
+        except KeyboardInterrupt:
+            print("\n\033[1m[✓] Live watch stopped.\033[0m\n")
+            return 0
+    else:
+        info = get_active_backup_info(request_fresh_stats=True)
+        render_status(info, requested_source=source_path, is_json=is_json)
+        return 0
+
+
+def cmd_now(args: list[str]) -> int:
+    """Trigger an immediate incremental backup."""
+    source_path, dest, is_fg, _ = parse_common_args(args)
+    if not os.path.exists(source_path):
+        print(f"\033[1;31mError:\033[0m Source directory '{source_path}' does not exist.", file=sys.stderr)
+        return 1
+
+    active_info = get_active_backup_info()
+    if active_info:
+        print("\033[1;33m[!] A Google Drive backup is already running:\033[0m")
+        if active_info["unit"]:
+            print(f"    Service Unit:  {active_info['unit']}.service")
+        if active_info["pid"]:
+            print(f"    Process PID:   {active_info['pid']}")
+        if active_info["stats_bytes"]:
+            sb = active_info["stats_bytes"]
+            print(f"    Progress:      {sb['transferred_bytes']} / {sb['total_bytes']} ({sb['percent_bytes']}) @ {sb['speed']} (ETA: {sb['eta']})")
+        print("\nUse '\033[1mgdrive-backup-stop\033[0m' to stop the active backup first if needed.")
+        return 1
+
+    print("\033[1;32m[+] Starting incremental Google Drive backup...\033[0m")
+    print(f"    Source:        {source_path}")
+    print(f"    Destination:   {dest}")
+    print(f"    Policy:        Incremental (existing remote files absent locally are preserved)")
+
+    if is_fg:
+        print("    Mode:          Foreground (live progress)\n")
+        cmd = [RCLONE_BIN, "copy", source_path, dest] + RCLONE_FLAGS + ["--progress"]
+        try:
+            return subprocess.call(cmd)
+        except KeyboardInterrupt:
+            print("\n\033[1;33mBackup interrupted by user.\033[0m")
+            return 130
+    else:
+        unit_name = PRIMARY_SERVICE_UNIT if source_path == os.path.expanduser("~/Documents") else "gdrive-backup"
+        cmd = [
+            "systemd-run",
+            "--user",
+            f"--unit={unit_name}",
+            f"--description=Google Drive Backup for {source_path}",
+            RCLONE_BIN,
+            "copy",
+            source_path,
+            dest,
+        ] + RCLONE_FLAGS + ["--stats", "1m", "--log-level", "INFO"]
+
+        subprocess.run(["systemctl", "--user", "reset-failed", f"{unit_name}.service"], capture_output=True)
+
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode != 0:
+            print(f"\033[1;31mError starting systemd unit:\033[0m {res.stderr.strip()}", file=sys.stderr)
+            print("Falling back to background process execution...")
+            log_path = Path.home() / ".cache" / "gdrive-backup.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a") as lf:
+                bg_proc = subprocess.Popen(
+                    [RCLONE_BIN, "copy", source_path, dest] + RCLONE_FLAGS + ["--stats", "1m", "--log-level", "INFO"],
+                    stdout=lf,
+                    stderr=lf,
+                    start_new_session=True,
+                )
+            print(f"\033[1;32m[✓] Backup started in background (PID: {bg_proc.pid})!\033[0m")
+            print(f"    Log File:      {log_path}")
+        else:
+            print(f"\033[1;32m[✓] Backup started as systemd service: {unit_name}.service\033[0m")
+            print(f"    Live Logs:     journalctl --user -u {unit_name} -f")
+
+        print("    Check Status:  gdrive-backup-status")
+        print("    Live Watch:    gdrive-backup-status --watch")
+        print("    Stop Backup:   gdrive-backup-stop\n")
+        return 0
+
+
+def print_schedule_usage(error_msg: str | None = None) -> None:
+    """Print detailed usage information on how to provide the datetime argument."""
+    if error_msg:
+        print(f"\033[1;31mError:\033[0m {error_msg}\n")
+
+    print("""\033[1mUsage:\033[0m gdrive-bakup-schedule "<datetime>" [--source <folder>]
+
+Schedule an incremental Google Drive backup to run at a specific date and time.
+
+\033[1mHow to provide the datetime argument:\033[0m
+  The datetime argument specifies when the backup should start.
+  Standard date-time strings, times of day, and relative offsets are supported.
+
+  \033[1mAccepted Formats & Examples:\033[0m
+    • Full Date & Time:
+        gdrive-bakup-schedule "2026-09-05 23:30:00"
+        gdrive-bakup-schedule "2026-09-05 23:30"
+        gdrive-bakup-schedule 2026-09-05 23:30
+
+    • Time Today (or tomorrow if the specified hour/min has already passed):
+        gdrive-bakup-schedule "23:00"
+        gdrive-bakup-schedule "14:15"
+
+    • Tomorrow with specific time:
+        gdrive-bakup-schedule "tomorrow 02:30"
+        gdrive-bakup-schedule "tomorrow 11:00"
+
+    • Relative time offsets:
+        gdrive-bakup-schedule "+2 hours"
+        gdrive-bakup-schedule "+45 minutes"
+
+\033[1mOptional Arguments:\033[0m
+  --source <folder>    Directory to back up (default: ~/Documents).
+                       Example: gdrive-bakup-schedule "23:00" --source ~/Documents
+
+\033[1mManagement:\033[0m
+  • View scheduled timers:  systemctl --user list-timers gdrive-backup-scheduled.timer
+  • Stop / cancel schedule: gdrive-backup-stop
+""")
+
+
+def parse_datetime(arg: str) -> tuple[int, str, str] | str | None:
+    """
+    Validate and parse datetime argument.
+    Returns: (epoch, formatted_calendar_str, human_readable_str) or 'PAST' or None.
+    """
+    p = subprocess.run(
+        ["date", "-d", arg, "+%s|%Y-%m-%d %H:%M:%S|%a %b %d %H:%M:%S %Z %Y"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if p.returncode != 0:
+        return None
+
+    try:
+        epoch_str, formatted, human = p.stdout.strip().split("|")
+        epoch = int(epoch_str)
+    except (ValueError, IndexError):
+        return None
+
+    now_epoch = int(datetime.datetime.now().timestamp())
+    if epoch <= now_epoch:
+        # Check if user specified a pure time string like "08:00" that already passed today
+        if ":" in arg and "-" not in arg and "/" not in arg:
+            p_tom = subprocess.run(
+                ["date", "-d", f"tomorrow {arg}", "+%s|%Y-%m-%d %H:%M:%S|%a %b %d %H:%M:%S %Z %Y"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if p_tom.returncode == 0:
+                try:
+                    epoch_tom_str, formatted_tom, human_tom = p_tom.stdout.strip().split("|")
+                    epoch_tom = int(epoch_tom_str)
+                    if epoch_tom > now_epoch:
+                        return epoch_tom, formatted_tom, human_tom
+                except (ValueError, IndexError):
+                    pass
+        return "PAST"
+
+    return epoch, formatted, human
+
+
+def cmd_schedule(args: list[str]) -> int:
+    """Schedule an incremental Google Drive backup at a given datetime."""
+    source_path, dest, _, remaining = parse_common_args(args)
+
+    if not remaining:
+        print_schedule_usage()
+        return 1
+
+    datetime_raw = " ".join(remaining).strip()
+    if not datetime_raw or datetime_raw in ("-h", "--help", "help"):
+        print_schedule_usage()
+        return 0
+
+    parsed = parse_datetime(datetime_raw)
+    if parsed is None:
+        print_schedule_usage(f"Invalid date/time specification '{datetime_raw}'.")
+        return 1
+    elif parsed == "PAST":
+        print_schedule_usage(f"The specified date/time '{datetime_raw}' is in the past. Please provide a future date/time.")
+        return 1
+
+    if not os.path.exists(source_path):
+        print(f"\033[1;31mError:\033[0m Source directory '{source_path}' does not exist.", file=sys.stderr)
+        return 1
+
+    epoch, systemd_cal, human_time = parsed
+    now_epoch = int(datetime.datetime.now().timestamp())
+    countdown_secs = max(0, epoch - now_epoch)
+
+    # Cancel previous scheduled timer if present
+    subprocess.run(["systemctl", "--user", "stop", f"{SCHEDULED_UNIT}.timer"], capture_output=True)
+    subprocess.run(["systemctl", "--user", "reset-failed", f"{SCHEDULED_UNIT}.timer"], capture_output=True)
+    subprocess.run(["systemctl", "--user", "reset-failed", f"{SCHEDULED_UNIT}.service"], capture_output=True)
+
+    cmd = [
+        "systemd-run",
+        "--user",
+        f"--unit={SCHEDULED_UNIT}",
+        f"--on-calendar={systemd_cal}",
+        f"--description=Scheduled Google Drive Backup for {source_path}",
+        RCLONE_BIN,
+        "copy",
+        source_path,
+        dest,
+    ] + RCLONE_FLAGS + ["--stats", "5m", "--log-level", "INFO"]
+
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode != 0:
+        print(f"\033[1;31mFailed to schedule backup timer:\033[0m {res.stderr.strip()}", file=sys.stderr)
+        return 1
+
+    print("\033[1;32m[✓] Google Drive backup scheduled successfully!\033[0m")
+    print(f"    Scheduled For: {human_time}")
+    print(f"    Starts In:     {format_seconds(countdown_secs)}")
+    print(f"    Source:        {source_path}")
+    print(f"    Destination:   {dest}")
+    print(f"    Timer Unit:    {SCHEDULED_UNIT}.timer")
+    print(f"    Policy:        Incremental (no remote deletions)")
+    print("\n\033[1mManagement:\033[0m")
+    print(f"    Check Status:  systemctl --user list-timers {SCHEDULED_UNIT}.timer")
+    print(f"    Cancel Timer:  gdrive-backup-stop\n")
+    return 0
+
+
+def cmd_estimate(args: list[str]) -> int:
+    """Estimate how much data needs to be backed up and the required time."""
+    source_path, dest, _, remaining = parse_common_args(args)
+    if not os.path.exists(source_path):
+        print(f"\033[1;31mError:\033[0m Source directory '{source_path}' does not exist.", file=sys.stderr)
+        return 1
+
+    force_scan = "--scan" in remaining or "--force" in remaining
+
+    # 1. Check if an active backup is currently running for the SAME source
+    active = get_active_backup_info()
+    if active and not force_scan:
+        act_src = os.path.abspath(str(active.get("detected_source") or os.path.expanduser("~/Documents")))
+        if act_src == source_path:
+            print("=" * 66)
+            print(" \033[1;32mGoogle Drive Backup — Active Transfer In Progress\033[0m")
+            print("=" * 66)
+            if active["unit"]:
+                print(f" Service Unit:     {active['unit']}.service")
+            if active["pid"]:
+                print(f" Process PID:      {active['pid']}")
+            if active["start_time"]:
+                print(f" Started At:       {active['start_time']}")
+            print(f" Source:           {source_path}")
+            print(f" Destination:      {dest}")
+            print(f" Policy:           Incremental (no remote deletions)")
+
+            sb = active["stats_bytes"]
+            sf = active["stats_files"]
+            if sb:
+                print("\n \033[1mLive Transfer Status:\033[0m")
+                print(f"   • Data Transferred: {sb['transferred_bytes']} / {sb['total_bytes']} ({sb['percent_bytes']})")
+                if sf:
+                    print(f"   • Files Processed:  {sf['transferred_files']} / {sf['total_files']} ({sf['percent_files']})")
+                print(f"   • Transfer Speed:   {sb['speed']}")
+                print(f"   • Estimated ETA:    \033[1;36m{sb['eta']}\033[0m remaining")
+            else:
+                print("\n Backup service is active; initial transfers/checkers are starting up...")
+                print(f" Check live progress using: journalctl --user -u {active['unit'] or PRIMARY_SERVICE_UNIT} -f")
+
+            print(" Check detailed status: \033[1mgdrive-backup-status\033[0m")
+            print(" To stop backup:        \033[1mgdrive-backup-stop\033[0m\n")
+            return 0
+        else:
+            print(f"\033[1;33m[Note]\033[0m Active backup is running for '{act_src}' (PID {active['pid']}).")
+            print(f"Estimating requested source folder '{source_path}' separately:\n")
+
+    # 2. Calculate differences against remote destination
+    print("=" * 66)
+    print(" \033[1;34mGoogle Drive Backup — Pre-Backup Estimate\033[0m")
+    print("=" * 66)
+    print(f" Source:           {source_path}")
+    print(f" Destination:      {dest}")
+    print(f" Policy:           Incremental (no remote deletions)")
+
+    print(" Calculating local files count and directory size...")
+    du_res = subprocess.run(["du", "-sb", source_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    local_bytes = 0
+    if du_res.returncode == 0:
+        try:
+            local_bytes = int(du_res.stdout.split()[0])
+        except (ValueError, IndexError):
+            pass
+
+    find_res = subprocess.run(
+        f"find '{source_path}' -type f | wc -l",
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    local_files = find_res.stdout.strip()
+
+    print(f" Local Summary:    {local_files} files (~{format_bytes(local_bytes)})")
+    print(" Scanning differences against Google Drive (dry-run)...")
+
+    dry_cmd = [
+        RCLONE_BIN,
+        "copy",
+        source_path,
+        dest,
+        "--dry-run",
+        "--use-json-log",
+        "--fast-list",
+    ] + RCLONE_FLAGS
+
+    proc = subprocess.run(dry_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    stats_data = None
+    for line in proc.stderr.splitlines():
+        if '"stats":{' in line:
+            try:
+                item = json.loads(line)
+                if "stats" in item and item["stats"]:
+                    stats_data = item["stats"]
+            except json.JSONDecodeError:
+                pass
+
+    if not stats_data:
+        print("\n\033[1;33mNote:\033[0m Could not retrieve JSON stats from remote. Scanning may be throttled.")
+        print(f"Estimated full upload time if unbacked (~{format_bytes(local_bytes)}):")
+        speeds = [(500 * 1024, "500 KiB/s (typical upload)"), (2 * 1024 * 1024, "2 MiB/s (broadband)"), (10 * 1024 * 1024, "10 MiB/s (high speed)")]
+        for spd_bytes, label in speeds:
+            sec = local_bytes / spd_bytes
+            print(f"   • At {label:<26}: ~{format_seconds(sec)}")
+        print("=" * 66 + "\n")
+        return 0
+
+    trans_bytes = stats_data.get("totalBytes", 0)
+    trans_files = stats_data.get("totalTransfers", 0)
+    checks = stats_data.get("totalChecks", 0)
+
+    print("\n \033[1mScan Results:\033[0m")
+    print(f"   • Files to Backup:  {trans_files} new or modified file(s)")
+    print(f"   • Data to Transfer: {format_bytes(trans_bytes)}")
+    if checks:
+        print(f"   • Already Synced:   {checks} file(s) up-to-date")
+
+    if trans_bytes == 0:
+        print("\n \033[1;32m[✓] All files on Google Drive are already completely up-to-date!\033[0m")
+        print("   Estimated Time Needed: 0 seconds")
+    else:
+        print("\n \033[1mEstimated Transfer Time Needed:\033[0m")
+        speeds = [
+            (500 * 1024, "500 KiB/s (typical upload)"),
+            (1 * 1024 * 1024, "1 MiB/s (standard rate)"),
+            (2 * 1024 * 1024, "2 MiB/s (fast upload)"),
+            (10 * 1024 * 1024, "10 MiB/s (high-speed fiber)"),
+        ]
+        for spd_bytes, label in speeds:
+            sec = trans_bytes / spd_bytes
+            print(f"   • At {label:<28}: ~{format_seconds(sec)}")
+
+    print("=" * 66)
+    print(" To start backup now:      \033[1mgdrive-backup-now\033[0m")
+    print(" To schedule for later:    \033[1mgdrive-bakup-schedule \"<time>\"\033[0m\n")
+    return 0
+
+
+def cmd_stop(args: list[str]) -> int:
+    """Stop any active backup process or scheduled timer."""
+    timer_only = "--timer-only" in args or "--timer" in args or "--schedule" in args
+    stopped_anything = False
+
+    # 1. Stop scheduled timer
+    timer_act = subprocess.run(
+        ["systemctl", "--user", "is-active", f"{SCHEDULED_UNIT}.timer"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    if timer_act in ("active", "waiting"):
+        subprocess.run(["systemctl", "--user", "stop", f"{SCHEDULED_UNIT}.timer"], capture_output=True)
+        print(f"\033[1;32m[✓] Cancelled scheduled timer:\033[0m {SCHEDULED_UNIT}.timer")
+        stopped_anything = True
+
+    if timer_only:
+        if not stopped_anything:
+            print("No scheduled backup timer was active.")
+        return 0
+
+    # 2. Stop systemd services
+    for unit in [PRIMARY_SERVICE_UNIT, "gdrive-backup", SCHEDULED_UNIT]:
+        is_act = subprocess.run(
+            ["systemctl", "--user", "is-active", unit],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+        if is_act in ("active", "activating"):
+            res = subprocess.run(["systemctl", "--user", "stop", f"{unit}.service"], capture_output=True)
+            if res.returncode == 0:
+                print(f"\033[1;32m[✓] Stopped systemd backup service:\033[0m {unit}.service")
+                stopped_anything = True
+
+    # 3. Kill any remaining rclone copy processes to gdrive
+    pgrep_res = subprocess.run(
+        ["pgrep", "-af", "rclone copy .*gdrive:"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    for line in pgrep_res.stdout.splitlines():
+        if "gdrive-backup" in line or "grep" in line:
+            continue
+        try:
+            pid = int(line.split()[0])
+            os.kill(pid, signal.SIGTERM)
+            print(f"\033[1;32m[✓] Terminated rclone process:\033[0m PID {pid}")
+            stopped_anything = True
+        except (ValueError, OSError):
+            pass
+
+    # Clean up failed unit states
+    for unit in [PRIMARY_SERVICE_UNIT, "gdrive-backup", SCHEDULED_UNIT]:
+        subprocess.run(["systemctl", "--user", "reset-failed", f"{unit}.service"], capture_output=True)
+    subprocess.run(["systemctl", "--user", "reset-failed", f"{SCHEDULED_UNIT}.timer"], capture_output=True)
+
+    if not stopped_anything:
+        print("No active Google Drive backup or scheduled timer was found running.")
+    else:
+        print("\033[1;32m[✓] Google Drive backup operations stopped.\033[0m")
+    return 0
+
+
+def main() -> int:
+    """Main CLI entrypoint."""
+    invoked_as = os.path.basename(sys.argv[0])
+    args = sys.argv[1:]
+
+    # Support invocation directly as aliased command names
+    if invoked_as in ("gdrive-backup-status", "gdrive-status"):
+        return cmd_status(args)
+    elif invoked_as == "gdrive-backup-now":
+        return cmd_now(args)
+    elif invoked_as in ("gdrive-bakup-schedule", "gdrive-backup-schedule"):
+        return cmd_schedule(args)
+    elif invoked_as == "gdrive-backup-estimate":
+        return cmd_estimate(args)
+    elif invoked_as == "gdrive-backup-stop":
+        return cmd_stop(args)
+
+    # Invocation as: gdrive-backup <subcommand>
+    if not args or args[0] in ("-h", "--help", "help"):
+        print("""\033[1mGoogle Drive Backup Manager\033[0m
+
+\033[1mUsage:\033[0m
+  gdrive-backup status [--watch] [--source <folder>] [--json]
+  gdrive-backup now [--source <folder>] [--fg]
+  gdrive-backup schedule "<datetime>" [--source <folder>]
+  gdrive-backup estimate [--source <folder>]
+  gdrive-backup stop [--timer-only]
+
+\033[1mCommands & Aliases in Terminal:\033[0m
+  gdrive-backup-status           Check backup status, start time, and progress
+  gdrive-backup-now              Start incremental backup immediately
+  gdrive-bakup-schedule <time>   Schedule backup for a specific date and time
+  gdrive-backup-estimate         Estimate upload size and required transfer time
+  gdrive-backup-stop             Stop active backup and cancel timers
+
+\033[1mOptions:\033[0m
+  --source <folder>              Source folder to back up (default: ~/Documents)
+  --dest <remote>                Destination folder on Google Drive (default: Document_Astrolab)
+  --watch, -w                    Continuously monitor live progress (status command)
+  --json                         Output status in structured JSON format
+  --fg, --foreground             Run backup in foreground with live terminal progress
+""")
+        return 0
+
+    subcommand = args[0]
+    subargs = args[1:]
+    if subcommand in ("status", "stat", "st", "progress", "info"):
+        return cmd_status(subargs)
+    elif subcommand in ("now", "start", "run"):
+        return cmd_now(subargs)
+    elif subcommand in ("schedule", "sched", "bakup-schedule", "backup-schedule"):
+        return cmd_schedule(subargs)
+    elif subcommand in ("estimate", "est"):
+        return cmd_estimate(subargs)
+    elif subcommand in ("stop", "kill", "cancel"):
+        return cmd_stop(subargs)
+    else:
+        print(f"\033[1;31mUnknown subcommand:\033[0m '{subcommand}'", file=sys.stderr)
+        print("Run 'gdrive-backup --help' for usage.", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
